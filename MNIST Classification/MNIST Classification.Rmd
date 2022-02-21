@@ -1,0 +1,403 @@
+---
+title: "MNIST: Classification"
+author: "Harshvardhan"
+navlink: "[Put Github Link](http://NAVLINK/)"
+og:
+  type: "article"
+  title: "opengraph title"
+  url: "optional opengraph url"
+  image: "optional opengraph image link"
+footer:
+  - content: '[link1](http://example.com/) • [link2](http://example.com/)<br/>'
+  - content: 'Copyright blah blah'
+date: "`r Sys.Date()`"
+#output: markdowntemplates::prismskel
+---
+
+The first step is to load all required libraries.
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(readr)
+library(yardstick)
+library(tune)
+```
+
+Setting up my custom `ggplot2` theme:
+
+```{r}
+theme_h = function(base_size = 14) {
+  theme_bw(base_size = base_size) %+replace%
+    theme(
+      # Specify plot title
+      plot.title = element_text(size = rel(1), face = "bold", family="serif", margin = margin(0,0,5,0), hjust = 0),
+      # Specifying grid and border
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      # Specidy axis details
+      axis.title = element_text(size = rel(0.85), face = "bold", family="serif"),
+      axis.text = element_text(size = rel(0.70), family="serif"),
+      axis.line = element_line(color = "black", arrow = arrow(length = unit(0.3, "lines"), type = "closed")),
+      # Specify legend details
+      legend.title = element_text(size = rel(0.85), face = "bold", family="serif"),
+      legend.text = element_text(size = rel(0.70), face = "bold", family="serif"),
+      legend.key = element_rect(fill = "transparent", colour = NA),
+      legend.key.size = unit(1.5, "lines"),
+      legend.background = element_rect(fill = "transparent", colour = NA),
+      # Remove default background
+      strip.background = element_rect(fill = "#17252D", color = "#17252D"),
+      strip.text = element_text(size = rel(0.85), face = "bold", color = "white", margin = margin(5,0,5,0), family="serif")
+    )
+}
+
+theme_set(theme_h())
+```
+
+# Loading Data and Pre-processing
+
+Original MNIST dataset by default is in an inconvenient format. Thus, I will use a CSV form of the dataset created by Joseph Redmon. I'm specifying `col_names = FALSE` because I do not need them. I will also scale the data between 0 and 1.
+
+```{r}
+mnist_raw = read_csv("mnist_train.csv", col_names = FALSE)
+mnist_raw[,2:785] = mnist_raw[,2:785]/255
+mnist_raw$X1 = factor(mnist_raw$X1)
+```
+
+So, there are 60,000 rows and 785 columns. The first column is the digit itself and the rest are pixels. Since its 28 x 28 image, there are 784 columns.
+
+# Data Exploration
+
+Let's see how many observations we have for each class.
+
+```{r}
+mnist_raw %>% 
+   count(X1, sort = T) %>% 
+   ggplot(aes(x = X1, y = n)) +
+   geom_col() +
+   labs(x = "Digit", y = "Frequency", title = "Number of observations for each digit")
+```
+
+There is no class imbalance problem. We have almost equal number of observations for each class.
+
+Now different people write digits differently. One way to measure how differently a digit can be written is to compare its distance from its mean. For example, how much variance is there in how 5 is written?
+
+I will write a small function that takes in a digit, filters all rows of that digit, computes its "center" (mean) and its root-mean-squared distance from center. Then, I will construct a violin plot to see how its distributed.
+
+```{r}
+distribution = function(df, x)
+{
+   # df is MNIST data
+   # x is the digit
+   
+   # Selecting that digit only
+   selected_rows = df %>% 
+      filter(X1 == x)
+   
+   # Calculating Mean Pixel
+   mean_pixel = selected_rows %>% 
+      select(-X1) %>% 
+      colMeans() %>% 
+      unname()
+   
+   # Calculating Variance
+   rms = c()
+   n = nrow(selected_rows)
+   for (i in 1:n)
+   {
+      row_pixels = as.numeric(selected_rows[i,2:785])
+      rms = c(rms, mean((row_pixels - mean_pixel)^2, na.rm = T))
+   }
+   return (rms)
+}
+```
+
+Now, let me run this function for all digits. I will store the results in a separate list.
+
+```{r}
+dists = tibble()
+
+for (i in 0:9)
+{
+   rms = distribution(mnist_raw, i)
+   value = cbind(i, rms)
+   dists = rbind(dists, value)
+}
+
+dists = as.data.frame(dists) %>% as_tibble()
+dists
+```
+
+The first column is the digit and the second column is the RMSE for each instance --- deviation from the mean. Considering these are pixel values, the exact value of mean or variance doesn't really mean anything (pun unintended). However, the distribution and scale of variance holds key information.
+
+Let's plot each distribution and see how they look. The shape of the violin comes from the error. Each error value is plotted as (almost) transparent point.
+
+```{r}
+dists %>% 
+   ggplot(aes(x = factor(i), y = rms, colour = factor(i))) +
+   geom_violin(show.legend = FALSE) +
+   geom_jitter(alpha = 0.1, size = 0.3) +
+   labs(x = "Digit", y = "RMSE") +
+   theme(legend.position = "none")
+```
+
+Clearly, almost everyone writes 1 similarly. The highest variance is in 3 and 8. Let's jump to modelling now.
+
+# Modelling
+
+I will set the seed value first.
+
+```{r}
+set.seed(0)
+```
+
+The first step is to create a training and testing split. I will use `initial_split()` for this. Default is 75/25, which works for me. Note that this has to stratified sampling because the values have to come from the data. Also specify 3-fold CV for calculating the classification metrics.
+
+```{r}
+# creating split
+mnist_split = initial_split(mnist_raw, strata = X1)
+
+# creating splitted dataset
+mnist_train = training(mnist_split)
+mnist_test = testing(mnist_split)
+
+# CV
+cv_folds = vfold_cv(mnist_train, v = 3, strata = X1) 
+```
+
+Let's see how they look.
+
+```{r}
+mnist_train
+mnist_test
+```
+
+I will try a random forest model first.
+
+## Setting up Pipeline
+
+### Engine
+
+I will set up the pipeline for a random forest model. I will use `ranger` package which is designed for large datasets. I will ask for auto-tuning of number of predictors to randomly sample (`mtry`), number of trees in the ensemble (`trees`) and `min-n` that specifies the minimum number of data points in a node that are required to be split further.
+
+```{r}
+rf_spec = rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>% 
+   set_mode("classification") %>% 
+   set_engine("ranger", importance = "impurity")
+rf_spec
+```
+
+### Set Tuning Parameters
+
+For hyper parameter tuning, I will use a range of hyper-parameters by organising them in a grid using `expand.grid()`. Total five models will be tried.
+
+```{r}
+grid_rf = grid_max_entropy(
+   mtry(range = c(1, 20)), 
+   trees(range = c(300, 1000)),
+   min_n(range = c(5, 50)),
+   size = 5)
+```
+
+### Workflow
+
+The next step is to add the formula and data. Since there two models for the same formula and data, I will only set it up once and reuse as required.
+
+```{r}
+mnist_wf = workflow() %>% 
+   add_formula(X1 ~ .) %>% 
+   add_model(rf_spec)
+mnist_wf
+```
+
+As seen, there is no model yet but only workflow.
+
+## Training Model
+
+Since the data is huge in size, I will first compare my results with just 10,000 rows from the training set. If it works for that set, it should work for the larger one too.
+
+```{r}
+index = sample(nrow(mnist_train), 10000)
+index[0:5]
+trial_train = mnist_train[index,]
+```
+
+I will add the training sample to the created workflow, along with the model (random forest).
+
+```{r}
+rf_rs_trial = mnist_wf %>% 
+   add_model(rf_spec) %>% 
+   fit(data = trial_train)
+rf_rs_trial
+```
+
+This gives us a Brier score of 0.13 on just the training set. To recall, [Brier score](https://en.wikipedia.org/wiki/Brier_score) is defined as
+
+$$
+BS = \frac{1}{N} \sum_{t=1}^N (f_t - o_t)^2,
+$$
+
+where $f_t$ is probability that the forecast $o_t$ was the actual outcome of the event at an instance $t$. This measure is considered better than measuring AUC or classification metrics because it considers the probabilistic nature of predictions.
+
+Now that I am confident at my formulation, I will try fitting the model with all training sample. Just out of curiosity, I will also measure the time taken. (I understand if I have to count average time, I should repeat this several times, but that is not my intention here.)
+
+```{r}
+t1 = Sys.time()
+rf_rs = mnist_wf %>%
+   fit(data = mnist_train)
+t2 = Sys.time()
+cat("Total time: ", (t2 - t1))
+```
+
+So, fitting a random forest model on 45,000 observations with 784 features took a little more than two minutes. Amazing!
+
+```{r}
+rf_rs
+```
+
+Wow, the Brier prediction error is only 0.08 now! Let's see the traditional classification metrics to see how it performs. But that is on a single sample, let's try 5-fold cross validation.
+
+```{r}
+c_metrics = metric_set(accuracy, sens, spec, roc_auc, mn_log_loss)
+
+# Fitting the model
+rf_fit = tune_grid(
+   mnist_wf,
+   resamples = cv_folds,
+   grid = grid_rf,
+   metrics = c_metrics,
+   control = control_grid(verbose = T)
+)
+
+# Results
+rf_fit
+```
+
+## Classification Metrics and Final Model
+
+Let's check the model metrics. I'm looking for accuracy, sensitivity, specificity and ROC Area Under Curve (AUC). I can check my metrics for each model using different hyper-parameters.
+
+```{r}
+collect_metrics(rf_fit)
+```
+
+AUC is staggering 99%+ --- which kind of implies this might not be a very difficult machine learning problem after all. The difficulty is in fitting the model because of its size.
+
+Let's see some plots!
+
+```{r}
+autoplot(rf_fit, metric = "accuracy")
+```
+
+Looking at this plot, I think we should choose 15 randomly selected predictors, around 600 trees and 10 or less minimum node size. Let's explore properties of the best model based on accuracy.
+
+```{r}
+show_best(rf_fit, metric = "accuracy")
+```
+
+These are the top performing models based on accuracy. Let me check the best models with AUC.
+
+```{r}
+show_best(rf_fit, metric = "roc_auc")
+```
+
+All of them have 99.8% AUC scores. The model is near perfect. Let's ask R to give the best model and fit that on the training set.
+
+```{r}
+best_model = select_best(rf_fit, metric = "accuracy")
+```
+
+Finally, train the model again based on the tuned parameters.
+
+```{r}
+tuned_model = mnist_wf %>% 
+   finalize_workflow(best_model) %>% 
+   fit(data = mnist_train)
+tuned_model
+```
+
+```{r}
+# saving predicted labels for the training set
+predicted_labels = predict(tuned_model, mnist_train)$.pred_class
+true_labels = mnist_train$X1
+train_labels = tibble(predicted_labels,
+                      true_labels)
+model_metrics = metrics(train_labels, truth = true_labels, estimate = predicted_labels)
+model_metrics
+```
+
+So, my final model is 99.9% accurate! Yay, assignment objective achieved. (It was to get a training accuracy greater than 97%). Cohen's Kappa is useful for unbalanced classes, but we didn't have that issue as we had explored earlier.
+
+Let's see training confusion matrix.
+
+```{r}
+conf_mat(train_labels, truth = true_labels, estimate = predicted_labels)
+```
+
+The inaccuracies are in single digits. The algorithm is definitely overpowered. Let's see its ROC curve. To do that, we will have to store probability for each possible predicted value by setting the type argument to `prob`.
+
+```{r}
+mnist_train_prob = tuned_model %>% 
+   predict(mnist_train, type = "prob") %>% 
+   bind_cols(mnist_train)
+mnist_train_prob
+```
+
+Each column (`.pred0` to `.pred9`) gives us the probability that that observation belonged to that class. Let's check AUC for each digit.
+
+```{r}
+mnist_train_prob %>% 
+   roc_curve(X1, .pred_0:.pred_9) %>% 
+   autoplot()
+```
+
+Needless to say, there cannot be a better set of ROC curves.
+
+Since multi-dimensional AUC curves are difficult to visualise together, I think it's time to check our model with testing data. That'll tell us our extent of over-fitting.
+
+# Testing Model
+
+```{r}
+# saving predicted labels for the test set
+predicted_labels = predict(tuned_model, mnist_test)$.pred_class
+```
+
+Let's find model's classification metrics.
+
+```{r}
+true_labels = mnist_test$X1
+train_labels = tibble(predicted_labels,
+                      true_labels)
+model_metrics = metrics(train_labels, truth = true_labels, estimate = predicted_labels)
+model_metrics
+```
+
+The test accuracy is 96.7% which is extremely good. Let's see its confusion matrix.
+
+```{r}
+conf_mat(train_labels, truth = true_labels, estimate = predicted_labels)
+```
+
+Now, there are some double digit errors but they are small compared to the accurate ones --- in thousands. This gives me confidence on my model. Let's see class-wise AUC curves as we saw earlier.
+
+```{r}
+mnist_test_prob = tuned_model %>% 
+   predict(mnist_test, type = "prob") %>% 
+   bind_cols(mnist_test)
+mnist_test_prob
+
+# AUC plot
+mnist_train_prob %>% 
+   roc_curve(X1, .pred_0:.pred_9) %>% 
+   autoplot()
+```
+
+Again, near perfect. I think the model is up and ready to be used. For completeness, here is the final model.
+
+```{r}
+tuned_model
+```
+
+# Conclusion
+
+With many parameters and hyper-parameters tuning, Random Forest is a rather complicated model. In this project, I used MNIST dataset to build a model that could predict the digit with a staggering 96.8% accuracy on the test set, and 99.9% accuracy on the training set.
