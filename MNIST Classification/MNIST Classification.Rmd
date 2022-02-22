@@ -1,17 +1,16 @@
 ---
 title: "MNIST: Classification"
 author: "Harshvardhan"
-navlink: "[Put Github Link](http://NAVLINK/)"
+navlink: "[Github](https://github.com/harshvardhaniimi/mnist-tidymodels)"
 og:
   type: "article"
   title: "opengraph title"
   url: "optional opengraph url"
   image: "optional opengraph image link"
 footer:
-  - content: '[link1](http://example.com/) • [link2](http://example.com/)<br/>'
-  - content: 'Copyright blah blah'
+  - content: '[Website](https://www.harsh17.in)<br/>'
 date: "`r Sys.Date()`"
-#output: markdowntemplates::prismskel
+output: markdowntemplates::prismskel
 ---
 
 The first step is to load all required libraries.
